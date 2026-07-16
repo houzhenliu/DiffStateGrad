@@ -45,7 +45,7 @@ def compute_svd_and_adaptive_rank(z_t, var_cutoff):
     return U, s, Vh, adaptive_rank
 
 def apply_diffstategrad(norm_grad, iteration_count, period, U=None, s=None, Vh=None, adaptive_rank=None,
-                        projection_mode="core"):
+                        projection_mode="core", projection_alpha=1.0):
     """
     Compute projected gradient using DiffStateGrad algorithm.
     
@@ -59,7 +59,10 @@ def apply_diffstategrad(norm_grad, iteration_count, period, U=None, s=None, Vh=N
         adaptive_rank: Computed adaptive rank
         projection_mode: Projection type. "core" matches the original DiffStateGrad
                          implementation; "tangent" uses the rank-r matrix tangent
-                         projection; "none" disables projection.
+                         projection; "hybrid" interpolates from core toward tangent;
+                         "none" disables projection.
+        projection_alpha: Tangent residual weight for hybrid mode:
+                          core + alpha * (tangent - core).
         
     Returns:
         torch.Tensor: Projected gradient if period condition is met, otherwise original gradient
@@ -75,7 +78,7 @@ def apply_diffstategrad(norm_grad, iteration_count, period, U=None, s=None, Vh=N
             projection_mode = "core"
         if projection_mode == "normal_removed":
             projection_mode = "tangent"
-        if projection_mode not in ["core", "tangent"]:
+        if projection_mode not in ["core", "tangent", "hybrid"]:
             raise ValueError(f"Unknown projection_mode '{projection_mode}'")
         
         A = U[:, :, :adaptive_rank]
@@ -93,7 +96,11 @@ def apply_diffstategrad(norm_grad, iteration_count, period, U=None, s=None, Vh=N
             # P_T(G) = U U^T G + G V V^T - U U^T G V V^T.
             left_grad = torch.matmul(A, torch.matmul(A.permute(0, 2, 1), grad))
             right_grad = torch.matmul(torch.matmul(grad, B.permute(0, 2, 1)), B)
-            projected_grad = left_grad + right_grad - core_grad
+            tangent_grad = left_grad + right_grad - core_grad
+            if projection_mode == "tangent":
+                projected_grad = tangent_grad
+            else:
+                projected_grad = core_grad + projection_alpha * (tangent_grad - core_grad)
         
         # Reshape projected gradient to match original shape
         projected_grad = projected_grad.float().unsqueeze(0)  # Add batch dimension back

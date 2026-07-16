@@ -123,6 +123,7 @@ def make_folder(sample_path, opt):
     latent_lr_str = "-latent_lr=({:.0e})".format(opt.latent_lr)
     period_str = "-period=({:d})".format(opt.period)
     projection_mode_str = "-projection=({})".format(opt.projection_mode)
+    projection_alpha_str = "-alpha=({:g})".format(opt.projection_alpha)
 
     folder_name += variance_cutoff_str
     folder_name += image_str
@@ -130,6 +131,8 @@ def make_folder(sample_path, opt):
     folder_name += latent_lr_str
     folder_name += period_str
     folder_name += projection_mode_str
+    if opt.projection_mode == "hybrid":
+        folder_name += projection_alpha_str
 
     folder_path = os.path.join(sample_path, folder_name)
     os.makedirs(folder_path, exist_ok=True)  # Create folder if it doesn't exist
@@ -157,8 +160,10 @@ parser.add_argument('--latent_max_iters', default=500, type=int)
 parser.add_argument('--seed', default=42, type=int)
 parser.add_argument('--period', default=1, type=int)
 parser.add_argument('--projection_mode', default="core",
-                    choices=["none", "core", "fixed", "tangent", "normal_removed"],
-                    help="Gradient projection mode. 'core' matches the original DiffStateGrad implementation; 'tangent' uses the rank-r matrix tangent projection.")
+                    choices=["none", "core", "fixed", "tangent", "normal_removed", "hybrid"],
+                    help="Gradient projection mode. 'core' matches the original DiffStateGrad implementation; 'tangent' uses the rank-r matrix tangent projection; 'hybrid' adds a weighted tangent residual to core.")
+parser.add_argument('--projection_alpha', default=1.0, type=float,
+                    help="Residual tangent weight for --projection_mode hybrid: core + alpha * (tangent - core).")
 
 args = parser.parse_args()
 
@@ -206,6 +211,7 @@ sample_fn = partial(sampler.posterior_sampler, measurement_cond_fn=measurement_c
                                         eta=args.ddim_eta, pixel_lr=args.pixel_lr, latent_lr=args.latent_lr,
                                         var_cutoff=args.var_cutoff, period=args.period,
                                         projection_mode=args.projection_mode,
+                                        projection_alpha=args.projection_alpha,
                                         pixel_max_iters=args.pixel_max_iters,
                                         latent_max_iters=args.latent_max_iters)
 

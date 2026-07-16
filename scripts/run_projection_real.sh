@@ -13,7 +13,7 @@ LATENT_LR="${LATENT_LR:-5e-3}"
 PIXEL_MAX_ITERS="${PIXEL_MAX_ITERS:-2000}"
 LATENT_MAX_ITERS="${LATENT_MAX_ITERS:-500}"
 SEED="${SEED:-42}"
-MODES="${MODES:-none core tangent}"
+MODES="${MODES:-none core hybrid:0.05 hybrid:0.1 hybrid:0.25 tangent}"
 
 export PYTHONPATH="${PYTHONPATH:-src/taming-transformers}"
 export MPLCONFIGDIR="${MPLCONFIGDIR:-/tmp/matplotlib}"
@@ -42,21 +42,63 @@ print_overall_progress() {
   printf "\rOverall [%s] %d/%d | elapsed %s | %s" "$bar" "$current" "$total" "$(format_seconds "$elapsed")" "$label"
 }
 
+mode_name() {
+  local token="$1"
+  case "$token" in
+    hybrid:*) echo "hybrid" ;;
+    hybrid_*) echo "hybrid" ;;
+    *) echo "$token" ;;
+  esac
+}
+
+format_alpha() {
+  printf "%g\n" "$1"
+}
+
+mode_alpha() {
+  local token="$1"
+  local raw
+  case "$token" in
+    hybrid:*) raw="${token#hybrid:}"; format_alpha "$raw" ;;
+    hybrid_*) raw="${token#hybrid_}"; format_alpha "$raw" ;;
+    *) echo "1" ;;
+  esac
+}
+
+mode_label() {
+  local token="$1"
+  local mode
+  local alpha
+  mode="$(mode_name "$token")"
+  alpha="$(mode_alpha "$token")"
+  if [[ "$mode" == "hybrid" ]]; then
+    echo "hybrid:${alpha}"
+  else
+    echo "$mode"
+  fi
+}
+
 run_one() {
   local image_id="$1"
-  local mode="$2"
+  local mode_token="$2"
   local period="$3"
+  local mode
+  local alpha
+  local label_mode
   local start_ts
   local end_ts
   local elapsed
   local global_start_ts
   local label
 
+  mode="$(mode_name "$mode_token")"
+  alpha="$(mode_alpha "$mode_token")"
+  label_mode="$(mode_label "$mode_token")"
   CURRENT_RUN=$((CURRENT_RUN + 1))
   global_start_ts="${GLOBAL_START_TS:-$(date +%s)}"
-  label="image=${image_id} mode=${mode}"
+  label="image=${image_id} mode=${label_mode}"
   echo
-  echo "===== [${CURRENT_RUN}/${TOTAL_RUNS}] Running image=${image_id}, projection_mode=${mode}, period=${period}, ddim_steps=${DDIM_STEPS} ====="
+  echo "===== [${CURRENT_RUN}/${TOTAL_RUNS}] Running image=${image_id}, projection_mode=${mode}, alpha=${alpha}, period=${period}, ddim_steps=${DDIM_STEPS} ====="
   print_overall_progress "$((CURRENT_RUN - 1))" "$TOTAL_RUNS" "starting ${label}" "$(($(date +%s) - global_start_ts))"
   echo
   start_ts="$(date +%s)"
@@ -68,6 +110,7 @@ run_one() {
     --ddim_steps "$DDIM_STEPS" \
     --period "$period" \
     --projection_mode "$mode" \
+    --projection_alpha "$alpha" \
     --var_cutoff "$VAR_CUTOFF" \
     --pixel_lr "$PIXEL_LR" \
     --latent_lr "$LATENT_LR" \
@@ -78,15 +121,15 @@ run_one() {
 
   end_ts="$(date +%s)"
   elapsed=$((end_ts - start_ts))
-  RUN_RECORDS+=("${image_id}|${mode}|${elapsed}")
+  RUN_RECORDS+=("${image_id}|${mode}|${alpha}|${label_mode}|${elapsed}")
   print_overall_progress "$CURRENT_RUN" "$TOTAL_RUNS" "finished ${label}" "$((end_ts - global_start_ts))"
   echo
 }
 
 period_for_mode() {
-  case "$1" in
+  case "$(mode_name "$1")" in
     none) echo 0 ;;
-    core|fixed|tangent|normal_removed) echo 5 ;;
+    core|fixed|tangent|normal_removed|hybrid) echo 5 ;;
     *) echo "Unknown mode '$1'" >&2; exit 1 ;;
   esac
 }
@@ -94,13 +137,14 @@ period_for_mode() {
 latest_log() {
   local image_id="$1"
   local mode="$2"
-  find "$SAVE_DIR" -name log_stats.txt \
+  local alpha="${3:-}"
+  local command=(find "$SAVE_DIR" -name log_stats.txt
     -path "*file_id=(${image_id})*" \
-    -path "*projection=(${mode})*" \
-    -printf '%T@ %p\n' \
-    | sort -n \
-    | tail -1 \
-    | cut -d' ' -f2-
+    -path "*projection=(${mode})*")
+  if [[ "$mode" == "hybrid" && -n "$alpha" ]]; then
+    command+=(-path "*alpha=(${alpha})*")
+  fi
+  "${command[@]}" -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-
 }
 
 metric_value() {
@@ -124,28 +168,28 @@ format_seconds() {
 GLOBAL_START_TS="$(date +%s)"
 
 for image_id in $IMAGE_IDS; do
-  for mode in $MODES; do
-    run_one "$image_id" "$mode" "$(period_for_mode "$mode")"
+  for mode_token in $MODES; do
+    run_one "$image_id" "$mode_token" "$(period_for_mode "$mode_token")"
   done
 done
 
 echo
 echo "===== Projection Real Run Summary ====="
-printf "%-8s %-10s %10s %10s %10s %10s %10s  %s\n" \
+printf "%-8s %-12s %10s %10s %10s %10s %10s  %s\n" \
   "image" "mode" "time" "PSNR" "NMSE" "SSIM" "LPIPS" "log"
 
 total_seconds=0
 run_count=0
 
 for record in "${RUN_RECORDS[@]}"; do
-  IFS='|' read -r image_id mode elapsed <<< "$record"
-  log_file="$(latest_log "$image_id" "$mode")"
+  IFS='|' read -r image_id mode alpha label_mode elapsed <<< "$record"
+  log_file="$(latest_log "$image_id" "$mode" "$alpha")"
   total_seconds=$((total_seconds + elapsed))
   run_count=$((run_count + 1))
 
   if [[ -z "$log_file" ]]; then
-    printf "%-8s %-10s %10s %10s %10s %10s %10s  %s\n" \
-      "$image_id" "$mode" "$(format_seconds "$elapsed")" "NA" "NA" "NA" "NA" "missing log"
+    printf "%-8s %-12s %10s %10s %10s %10s %10s  %s\n" \
+      "$image_id" "$label_mode" "$(format_seconds "$elapsed")" "NA" "NA" "NA" "NA" "missing log"
     continue
   fi
 
@@ -153,8 +197,8 @@ for record in "${RUN_RECORDS[@]}"; do
   nmse="$(metric_value "$log_file" nmse)"
   ssim="$(metric_value "$log_file" ssim)"
   lpips="$(metric_value "$log_file" lpips)"
-  printf "%-8s %-10s %10s %10.4f %10.6f %10.6f %10.6f  %s\n" \
-    "$image_id" "$mode" "$(format_seconds "$elapsed")" "$psnr" "$nmse" "$ssim" "$lpips" "$log_file"
+  printf "%-8s %-12s %10s %10.4f %10.6f %10.6f %10.6f  %s\n" \
+    "$image_id" "$label_mode" "$(format_seconds "$elapsed")" "$psnr" "$nmse" "$ssim" "$lpips" "$log_file"
 done
 
 if (( run_count > 0 )); then

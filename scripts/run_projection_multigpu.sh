@@ -14,7 +14,7 @@ LATENT_LR="${LATENT_LR:-5e-3}"
 PIXEL_MAX_ITERS="${PIXEL_MAX_ITERS:-2000}"
 LATENT_MAX_ITERS="${LATENT_MAX_ITERS:-500}"
 SEED="${SEED:-42}"
-MODES="${MODES:-none core tangent}"
+MODES="${MODES:-none core hybrid:0.05 hybrid:0.1 hybrid:0.25 tangent}"
 POLL_SECONDS="${POLL_SECONDS:-5}"
 
 export PYTHONPATH="${PYTHONPATH:-src/taming-transformers}"
@@ -25,10 +25,46 @@ mkdir -p "$SAVE_DIR"
 RUN_LOG_DIR="$SAVE_DIR/multigpu_logs/$(date +%Y-%m-%d_%H-%M-%S)"
 mkdir -p "$RUN_LOG_DIR"
 
+mode_name() {
+  local token="$1"
+  case "$token" in
+    hybrid:*) echo "hybrid" ;;
+    hybrid_*) echo "hybrid" ;;
+    *) echo "$token" ;;
+  esac
+}
+
+format_alpha() {
+  printf "%g\n" "$1"
+}
+
+mode_alpha() {
+  local token="$1"
+  local raw
+  case "$token" in
+    hybrid:*) raw="${token#hybrid:}"; format_alpha "$raw" ;;
+    hybrid_*) raw="${token#hybrid_}"; format_alpha "$raw" ;;
+    *) echo "1" ;;
+  esac
+}
+
+mode_label() {
+  local token="$1"
+  local mode
+  local alpha
+  mode="$(mode_name "$token")"
+  alpha="$(mode_alpha "$token")"
+  if [[ "$mode" == "hybrid" ]]; then
+    echo "hybrid:${alpha}"
+  else
+    echo "$mode"
+  fi
+}
+
 period_for_mode() {
-  case "$1" in
+  case "$(mode_name "$1")" in
     none) echo 0 ;;
-    core|fixed|tangent|normal_removed) echo 5 ;;
+    core|fixed|tangent|normal_removed|hybrid) echo 5 ;;
     *) echo "Unknown mode '$1'" >&2; exit 1 ;;
   esac
 }
@@ -64,13 +100,14 @@ print_progress() {
 latest_log() {
   local image_id="$1"
   local mode="$2"
-  find "$SAVE_DIR" -name log_stats.txt \
+  local alpha="${3:-}"
+  local command=(find "$SAVE_DIR" -name log_stats.txt
     -path "*file_id=(${image_id})*" \
-    -path "*projection=(${mode})*" \
-    -printf '%T@ %p\n' \
-    | sort -n \
-    | tail -1 \
-    | cut -d' ' -f2-
+    -path "*projection=(${mode})*")
+  if [[ "$mode" == "hybrid" && -n "$alpha" ]]; then
+    command+=(-path "*alpha=(${alpha})*")
+  fi
+  "${command[@]}" -printf '%T@ %p\n' | sort -n | tail -1 | cut -d' ' -f2-
 }
 
 metric_value() {
@@ -81,8 +118,8 @@ metric_value() {
 
 TASKS=()
 for image_id in $IMAGE_IDS; do
-  for mode in $MODES; do
-    TASKS+=("${image_id}|${mode}|$(period_for_mode "$mode")")
+  for mode_token in $MODES; do
+    TASKS+=("${image_id}|$(mode_name "$mode_token")|$(mode_alpha "$mode_token")|$(mode_label "$mode_token")|$(period_for_mode "$mode_token")")
   done
 done
 
@@ -135,11 +172,11 @@ start_task() {
   local task_index="$2"
   local gpu="${GPUS[$slot]}"
   local task="${TASKS[$task_index]}"
-  local image_id mode period label worker_log
+  local image_id mode alpha label_mode period label worker_log
 
-  IFS='|' read -r image_id mode period <<< "$task"
-  label="image=${image_id} mode=${mode} gpu=${gpu}"
-  worker_log="$RUN_LOG_DIR/task_$((task_index + 1))_${image_id}_${mode}_gpu${gpu}.log"
+  IFS='|' read -r image_id mode alpha label_mode period <<< "$task"
+  label="image=${image_id} mode=${label_mode} gpu=${gpu}"
+  worker_log="$RUN_LOG_DIR/task_$((task_index + 1))_${image_id}_${label_mode//:/_}_gpu${gpu}.log"
 
   echo "Starting [$((task_index + 1))/${total_tasks}] ${label}"
 
@@ -152,6 +189,7 @@ start_task() {
       --ddim_steps "$DDIM_STEPS" \
       --period "$period" \
       --projection_mode "$mode" \
+      --projection_alpha "$alpha" \
       --var_cutoff "$VAR_CUTOFF" \
       --pixel_lr "$PIXEL_LR" \
       --latent_lr "$LATENT_LR" \
@@ -219,27 +257,27 @@ done
 
 echo
 echo "===== Projection Multi-GPU Summary ====="
-printf "%-8s %-10s %10s %8s %10s %10s %10s %10s  %s\n" \
+printf "%-8s %-12s %10s %8s %10s %10s %10s %10s  %s\n" \
   "image" "mode" "time" "status" "PSNR" "NMSE" "SSIM" "LPIPS" "worker_log"
 
 total_seconds=0
 ok_count=0
 
 for record in "${RUN_RECORDS[@]}"; do
-  IFS='|' read -r image_id mode period elapsed status worker_log <<< "$record"
+  IFS='|' read -r image_id mode alpha label_mode period elapsed status worker_log <<< "$record"
   total_seconds=$((total_seconds + elapsed))
 
   if [[ "$status" != "ok" ]]; then
-    printf "%-8s %-10s %10s %8s %10s %10s %10s %10s  %s\n" \
-      "$image_id" "$mode" "$(format_seconds "$elapsed")" "$status" "NA" "NA" "NA" "NA" "$worker_log"
+    printf "%-8s %-12s %10s %8s %10s %10s %10s %10s  %s\n" \
+      "$image_id" "$label_mode" "$(format_seconds "$elapsed")" "$status" "NA" "NA" "NA" "NA" "$worker_log"
     continue
   fi
 
   ok_count=$((ok_count + 1))
-  log_file="$(latest_log "$image_id" "$mode")"
+  log_file="$(latest_log "$image_id" "$mode" "$alpha")"
   if [[ -z "$log_file" ]]; then
-    printf "%-8s %-10s %10s %8s %10s %10s %10s %10s  %s\n" \
-      "$image_id" "$mode" "$(format_seconds "$elapsed")" "$status" "NA" "NA" "NA" "NA" "$worker_log"
+    printf "%-8s %-12s %10s %8s %10s %10s %10s %10s  %s\n" \
+      "$image_id" "$label_mode" "$(format_seconds "$elapsed")" "$status" "NA" "NA" "NA" "NA" "$worker_log"
     continue
   fi
 
@@ -247,8 +285,8 @@ for record in "${RUN_RECORDS[@]}"; do
   nmse="$(metric_value "$log_file" nmse)"
   ssim="$(metric_value "$log_file" ssim)"
   lpips="$(metric_value "$log_file" lpips)"
-  printf "%-8s %-10s %10s %8s %10.4f %10.6f %10.6f %10.6f  %s\n" \
-    "$image_id" "$mode" "$(format_seconds "$elapsed")" "$status" "$psnr" "$nmse" "$ssim" "$lpips" "$worker_log"
+  printf "%-8s %-12s %10s %8s %10.4f %10.6f %10.6f %10.6f  %s\n" \
+    "$image_id" "$label_mode" "$(format_seconds "$elapsed")" "$status" "$psnr" "$nmse" "$ssim" "$lpips" "$worker_log"
 done
 
 echo

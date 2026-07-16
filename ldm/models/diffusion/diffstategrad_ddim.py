@@ -55,7 +55,7 @@ def compute_svd_and_adaptive_rank(z_t, var_cutoff):
     return U, s, Vh, adaptive_rank
 
 def apply_diffstategrad(norm_grad, iteration_count, period, U=None, s=None, Vh=None, adaptive_rank=None,
-                        projection_mode="core"):
+                        projection_mode="core", projection_alpha=1.0):
     """
     Compute projected gradient using DiffStateGrad algorithm.
     
@@ -69,7 +69,10 @@ def apply_diffstategrad(norm_grad, iteration_count, period, U=None, s=None, Vh=N
         adaptive_rank: Computed adaptive rank
         projection_mode: Projection type. "core" matches the original DiffStateGrad
                          implementation; "tangent" uses the rank-r matrix tangent
-                         projection; "none" disables projection.
+                         projection; "hybrid" interpolates from core toward tangent;
+                         "none" disables projection.
+        projection_alpha: Tangent residual weight for hybrid mode:
+                          core + alpha * (tangent - core).
         
     Returns:
         torch.Tensor: Projected gradient if period condition is met, otherwise original gradient
@@ -86,7 +89,7 @@ def apply_diffstategrad(norm_grad, iteration_count, period, U=None, s=None, Vh=N
         if projection_mode == "normal_removed":
             projection_mode = "tangent"
         
-        if projection_mode not in ["core", "tangent"]:
+        if projection_mode not in ["core", "tangent", "hybrid"]:
             raise ValueError(f"Unknown projection_mode '{projection_mode}'")
 
         A = U[:, :, :adaptive_rank]
@@ -104,7 +107,11 @@ def apply_diffstategrad(norm_grad, iteration_count, period, U=None, s=None, Vh=N
             # P_T(G) = U U^T G + G V V^T - U U^T G V V^T.
             left_grad = torch.matmul(A, torch.matmul(A.permute(0, 2, 1), grad))
             right_grad = torch.matmul(torch.matmul(grad, B.permute(0, 2, 1)), B)
-            projected_grad = left_grad + right_grad - core_grad
+            tangent_grad = left_grad + right_grad - core_grad
+            if projection_mode == "tangent":
+                projected_grad = tangent_grad
+            else:
+                projected_grad = core_grad + projection_alpha * (tangent_grad - core_grad)
         
         # Reshape projected gradient to match original shape
         projected_grad = projected_grad.float().unsqueeze(0)  # Add batch dimension back
@@ -248,6 +255,7 @@ class DDIMSampler(object):
                var_cutoff=None,
                period=None,
                projection_mode="core",
+               projection_alpha=1.0,
                pixel_max_iters=2000,
                latent_max_iters=500,
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
@@ -290,6 +298,7 @@ class DDIMSampler(object):
                                                         unconditional_conditioning=unconditional_conditioning, pixel_lr=pixel_lr,
                                                         latent_lr=latent_lr, var_cutoff=var_cutoff, period=period,
                                                         projection_mode=projection_mode,
+                                                        projection_alpha=projection_alpha,
                                                         pixel_max_iters=pixel_max_iters,
                                                         latent_max_iters=latent_max_iters
                                                         )
@@ -307,6 +316,7 @@ class DDIMSampler(object):
                      temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                      unconditional_guidance_scale=1., unconditional_conditioning=None, pixel_lr=None, latent_lr=None,
                      var_cutoff=None, period=None, projection_mode="core",
+                     projection_alpha=1.0,
                      pixel_max_iters=2000, latent_max_iters=500):
         """
         DDIM-based sampling function for ReSample.
@@ -419,7 +429,8 @@ class DDIMSampler(object):
                                                           operator_fn=operator_fn, max_iters=pixel_max_iters,
                                                           lr=pixel_lr, var_cutoff=var_cutoff,
                                                           x_prev=self.model.decode_first_stage(img.detach().clone()),
-                                                          period=period, projection_mode=projection_mode)
+                                                          period=period, projection_mode=projection_mode,
+                                                          projection_alpha=projection_alpha)
                         
                         opt_var = self.model.encode_first_stage(opt_var) # Going back into latent space
 
@@ -434,7 +445,8 @@ class DDIMSampler(object):
                                                              operator_fn=operator_fn, max_iters=latent_max_iters,
                                                              lr=latent_lr, var_cutoff=var_cutoff,
                                                              z_prev=img.detach(), period=period,
-                                                             projection_mode=projection_mode)
+                                                             projection_mode=projection_mode,
+                                                             projection_alpha=projection_alpha)
 
 
                         sigma = 40 * (1-a_prev)/(1 - a_t) * (1 - a_t / a_prev) # Change the 40 value for each task
@@ -453,13 +465,14 @@ class DDIMSampler(object):
                                                              operator_fn=operator_fn, max_iters=latent_max_iters,
                                                              lr=latent_lr, var_cutoff=var_cutoff,
                                                              z_prev=img.detach(), period=period,
-                                                             projection_mode=projection_mode)
+                                                             projection_mode=projection_mode,
+                                                             projection_alpha=projection_alpha)
         img = psuedo_x0.detach().clone()
             
         return img, intermediates
 
 
-    def pixel_optimization(self, measurement, x_prime, operator_fn, eps=1e-3, max_iters=2000, lr=None, var_cutoff=None, x_prev=None, period=None, projection_mode="core"):
+    def pixel_optimization(self, measurement, x_prime, operator_fn, eps=1e-3, max_iters=2000, lr=None, var_cutoff=None, x_prev=None, period=None, projection_mode="core", projection_alpha=1.0):
         """
         Function to compute argmin_x ||y - A(x)||_2^2
 
@@ -500,7 +513,8 @@ class DDIMSampler(object):
             measurement_loss.backward() # Take GD step
 
             opt_var.grad = apply_diffstategrad(opt_var.grad, itr, period,
-            U, s, Vh, adaptive_rank, projection_mode=projection_mode)
+            U, s, Vh, adaptive_rank, projection_mode=projection_mode,
+            projection_alpha=projection_alpha)
 
             optimizer.step()
 
@@ -511,7 +525,7 @@ class DDIMSampler(object):
         return opt_var
 
 
-    def latent_optimization(self, measurement, z_init, operator_fn, eps=1e-3, max_iters=500, lr=None, var_cutoff=None, z_prev=None, period=None, projection_mode="core"):
+    def latent_optimization(self, measurement, z_init, operator_fn, eps=1e-3, max_iters=500, lr=None, var_cutoff=None, z_prev=None, period=None, projection_mode="core", projection_alpha=1.0):
 
         """
         Function to compute argmin_z ||y - A( D(z) )||_2^2
@@ -561,7 +575,8 @@ class DDIMSampler(object):
             output.backward() # Take GD step
 
             z_init.grad = apply_diffstategrad(z_init.grad, itr, period,
-            U, s, Vh, adaptive_rank, projection_mode=projection_mode)
+            U, s, Vh, adaptive_rank, projection_mode=projection_mode,
+            projection_alpha=projection_alpha)
 
             optimizer.step()
             cur_loss = output.detach().cpu().numpy() 
