@@ -5,7 +5,10 @@ import torch.nn.functional as F
 from torch import nn
 from torch.autograd import Variable
 import matplotlib.pyplot as plt
-from motionblur.motionblur import Kernel
+try:
+    from motionblur.motionblur import Kernel
+except ImportError:
+    Kernel = None
 from .fastmri_utils import fft2c_new, ifft2c_new
 
 
@@ -291,6 +294,8 @@ class Blurkernel(nn.Module):
             for name, f in self.named_parameters():
                 f.data.copy_(k)
         elif self.blur_type == "motion":
+            if Kernel is None:
+                raise ImportError("motionblur is required for motion blur kernels.")
             k = Kernel(size=(self.kernel_size, self.kernel_size), intensity=self.std).kernelMatrix
             k = torch.from_numpy(k)
             self.k = k

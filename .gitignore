@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+/models/
+/results/
+/results_*/
+
+.cache/
+.pytest_cache/
+
+*.aux
+*.log
+*.out
+*.toc
+tangent_space_research_note.pdf

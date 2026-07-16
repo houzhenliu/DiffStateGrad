@@ -10,12 +10,13 @@ def load_yaml(file_path: str) -> dict:
 
 def load_model_from_config(config, ckpt, train=False):
     print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt)#, map_location="cpu")
+    pl_sd = torch.load(ckpt, map_location="cpu", weights_only=False)
     sd = pl_sd["state_dict"]
     model = instantiate_from_config(config.model)
     _, _ = model.load_state_dict(sd, strict=False)
-    
-    model.cuda()
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(device)
 
     if train:
       model.train()

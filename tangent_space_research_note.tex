@@ -1,0 +1,397 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{fontspec}
+\usepackage{xeCJK}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{hyperref}
+
+\setmainfont{Latin Modern Roman}
+\setsansfont{Latin Modern Sans}
+\setmonofont{Latin Modern Mono}
+\setCJKmainfont{Noto Serif CJK SC}
+\setCJKsansfont{Noto Sans CJK SC}
+\setCJKmonofont{Noto Sans Mono CJK SC}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\title{DiffStateGrad 的切线空间假设是否成立：\\
+一个无训练几何修正方向的研究草稿}
+\author{}
+\date{2026-07-16}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+DiffStateGrad 将 measurement guidance gradient 投影到由当前扩散状态奇异向量张成的低秩子空间，并将该操作解释为近似数据流形切线空间的投影。
+本文档重新检查这个几何解释。
+核心观察是：现有实现中的投影
+\[
+    G_{\mathrm{core}} = U_r U_r^\top G V_r V_r^\top
+\]
+只保留了梯度在低秩矩阵的 ``core'' 方向上的分量，而不等于 rank-$r$ 矩阵流形的标准切线空间投影。
+若把当前扩散状态近似为 rank-$r$ 矩阵，真正的低秩矩阵流形切线投影应为
+\[
+    G_{\mathrm{tan}}
+    = U_r U_r^\top G + G V_r V_r^\top
+    - U_r U_r^\top G V_r V_r^\top .
+\]
+因此，一个比动态阈值更有意义的研究方向是：检验 DiffStateGrad 的性能收益到底来自 ``切线空间投影''，还是来自更窄的谱 core 滤波；并进一步用正确的低秩切线投影替代原投影。
+\end{abstract}
+
+\section{研究问题}
+
+扩散逆问题的目标是在预训练扩散模型不重新训练的情况下，从退化观测 $y = A(x) + n$ 中恢复干净图像 $x$。
+ReSample 一类方法通常在反向扩散过程中加入 measurement guidance，用观测一致性梯度修正当前状态。
+DiffStateGrad 的主要想法是：直接使用观测梯度可能把样本推离自然图像流形，因此需要把梯度投影到由当前扩散状态估计出来的低维方向上。
+
+本文档关心的问题不是 ``固定阈值 $0.99$ 是否应该改成动态阈值''，而是一个更基础的问题：
+\begin{quote}
+DiffStateGrad 当前使用的 SVD 投影，是否真的是一个合理的切线空间近似？
+\end{quote}
+
+这个问题重要，因为如果原方法的几何解释本身不准确，那么单纯调整阈值只能修补一个二级超参数；更有意义的改进应当先修正投影空间本身。
+
+\section{原 DiffStateGrad 实际做了什么}
+
+设当前扩散状态或其解码图像可以写成矩阵形式
+\[
+    Z_t \in \mathbb{R}^{H \times W}.
+\]
+为了简化说明，先讨论单通道矩阵；多通道情形可以对每个通道分别处理，或把通道并入 batch 维度。
+对 $Z_t$ 做截断 SVD：
+\[
+    Z_t \approx U_r \Sigma_r V_r^\top ,
+\]
+其中
+\[
+    U_r \in \mathbb{R}^{H \times r}, \qquad
+    V_r \in \mathbb{R}^{W \times r}.
+\]
+设观测一致性损失对当前变量的梯度为
+\[
+    G = \nabla_Z \|A(Z) - y\|_2^2 .
+\]
+
+现有 DiffStateGrad 代码中的投影形式等价于
+\[
+    \boxed{
+    G_{\mathrm{core}}
+    = U_r U_r^\top G V_r V_r^\top .
+    }
+    \label{eq:core}
+\]
+这一步的含义是：只有当梯度同时落入 $U_r$ 的列空间和 $V_r$ 的列空间时，该梯度分量才被保留。
+换句话说，原投影保留的是低秩表示中的 core 变化：
+\[
+    \Delta Z = U_r M V_r^\top ,
+\]
+其中 $M \in \mathbb{R}^{r \times r}$。
+
+\paragraph{关键点}
+式 \eqref{eq:core} 是一个很强的谱滤波器，但它不是 rank-$r$ 矩阵流形的完整切线空间投影。
+因此，若论文把该操作称为 ``切线空间投影''，这个表述至少是不精确的。
+
+\section{真正的低秩矩阵切线空间是什么}
+
+考虑固定 rank 的矩阵流形
+\[
+    \mathcal{M}_r =
+    \{Z \in \mathbb{R}^{H \times W}: \operatorname{rank}(Z)=r\}.
+\]
+在点
+\[
+    Z = U_r \Sigma_r V_r^\top
+\]
+处，$\mathcal{M}_r$ 的切线空间不是只包含 $U_r M V_r^\top$。
+标准结果表明，其切线空间可以写成
+\[
+    T_Z \mathcal{M}_r
+    =
+    \left\{
+    U_r M V_r^\top
+    + U_{\perp} A V_r^\top
+    + U_r B V_{\perp}^\top
+    \right\}.
+\]
+三项分别表示：
+\begin{enumerate}[label=(\arabic*)]
+    \item 改变奇异值或 core 系数；
+    \item 改变左奇异子空间；
+    \item 改变右奇异子空间。
+\end{enumerate}
+
+因此，真正的切线空间不仅允许改变 $\Sigma_r$，也允许 $U_r$ 和 $V_r$ 本身发生一阶变化。
+这正是原 DiffStateGrad 投影丢掉的部分。
+
+给定任意梯度矩阵 $G$，它到 $T_Z \mathcal{M}_r$ 的正交投影为
+\[
+    \boxed{
+    G_{\mathrm{tan}}
+    =
+    U_r U_r^\top G
+    + G V_r V_r^\top
+    - U_r U_r^\top G V_r V_r^\top .
+    }
+    \label{eq:tangent}
+\]
+
+这个公式可以理解为：
+\begin{itemize}
+    \item $U_r U_r^\top G$：保留与左子空间一致的变化；
+    \item $G V_r V_r^\top$：保留与右子空间一致的变化；
+    \item $-U_r U_r^\top G V_r V_r^\top$：减去被前两项重复计算的 core 部分。
+\end{itemize}
+
+\section{为什么这比动态阈值更有研究价值}
+
+动态阈值主要解决的是 ``保留多少个奇异方向''。
+但如果被保留的空间本身就不是正确的切线空间，那么动态阈值只是改变 rank $r$，并没有修正投影几何。
+
+更具体地说，原计划中的动态门控可以写成
+\[
+    G_{\mathrm{soft}}
+    =
+    U \operatorname{diag}(a) U^\top
+    G
+    V \operatorname{diag}(a) V^\top ,
+\]
+其中 $a_i$ 根据噪声水平和奇异值大小决定。
+这个方法仍然是 core-only 投影的软版本。
+它可能减少噪声方向，但不会恢复低秩矩阵切线空间中与子空间变化相关的部分。
+
+因此，本文档建议把主创新从
+\begin{quote}
+固定阈值改成动态阈值
+\end{quote}
+调整为
+\begin{quote}
+指出原 DiffStateGrad 的 ``切线空间'' 实际上是 core-only 谱投影，并用正确的低秩切线投影修正它。
+\end{quote}
+
+这个新问题更基础，也更容易形成清晰的论文贡献：
+\begin{enumerate}[label=\textbf{C\arabic*.}]
+    \item \textbf{几何诊断：} 证明原 DiffStateGrad 的投影不是 rank-$r$ 矩阵流形切线投影，而是更窄的 core 投影。
+    \item \textbf{方法修正：} 提出 proper tangent projection，用式 \eqref{eq:tangent} 替代式 \eqref{eq:core}。
+    \item \textbf{实证验证：} 比较 core-only、proper tangent、normal removal、dynamic tangent 等投影，检验原方法收益到底来自哪一种几何约束。
+\end{enumerate}
+
+\section{候选方法}
+
+\begin{table}[h]
+\centering
+\caption{建议优先比较的投影方法。}
+\label{tab:methods}
+\begin{tabular}{lll}
+\toprule
+编号 & 名称 & 投影形式 \\
+\midrule
+M0 & ReSample & $G$ \\
+M1 & DiffStateGrad core & $U_r U_r^\top G V_r V_r^\top$ \\
+M2 & Proper tangent & $U_r U_r^\top G + G V_r V_r^\top - U_r U_r^\top G V_r V_r^\top$ \\
+M3 & Normal removal & $G - (I-U_rU_r^\top)G(I-V_rV_r^\top)$ \\
+M4 & Soft tangent & $P_U G + G P_V - P_U G P_V$, with soft $P_U,P_V$ \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+其中 M3 与 M2 形式上等价，因为
+\[
+    G - (I-U_rU_r^\top)G(I-V_rV_r^\top)
+    =
+    U_r U_r^\top G + G V_r V_r^\top - U_r U_r^\top G V_r V_r^\top .
+\]
+但把它命名为 normal removal 有助于解释方法直觉：
+\begin{quote}
+我们不是只保留 core，而是只删除同时垂直于左右主子空间的 normal 分量。
+\end{quote}
+
+\section{预期差异}
+
+原 core-only 投影更保守。
+它会强烈压缩梯度，因此可能减少伪影，但也可能丢掉有用的 measurement correction。
+Proper tangent 投影更宽。
+它保留了改变左右子空间的一阶方向，因此理论上更符合低秩流形局部几何，也可能带来更好的数据一致性。
+
+两者可能出现如下经验差异：
+\begin{itemize}
+    \item 若 core-only 的优势主要来自强降噪，M1 可能在高噪声或强 guidance 下更稳定。
+    \item 若原方法确实因为过度压缩梯度而损失观测一致性，M2/M3 应该提升 PSNR 或 residual。
+    \item 若 proper tangent 释放了过多自由度，M2 可能需要配合 rank selection 或 soft spectral weights。
+    \item 若 M2 在 phase retrieval 上减少失败率，这将支持 ``原切线近似过窄'' 的判断。
+\end{itemize}
+
+\section{最小实验设计}
+
+为了快速判断这个研究方向是否值得继续，建议先做一个小实验，而不是直接跑完整 100 张。
+
+\subsection{Smoke Test}
+
+使用仓库自带的两张图像：
+\[
+    \{60004, 60074\}.
+\]
+任务选择 box inpainting，因为它最容易跑通，也最容易肉眼判断投影是否产生明显伪影。
+比较方法：
+\[
+    \mathrm{M0}, \mathrm{M1}, \mathrm{M2}.
+\]
+核心检查：
+\begin{itemize}
+    \item 是否能正常运行，不出现 NaN 或 Inf；
+    \item 投影后梯度范数是否异常放大；
+    \item reconstruction 是否明显退化；
+    \item measurement residual 是否比 M1 更差。
+\end{itemize}
+
+\subsection{Pilot Test}
+
+固定 20 张 FFHQ 图像，任务选择：
+\[
+    \text{Box inpainting}, \qquad \text{Phase retrieval}.
+\]
+比较方法：
+\[
+    \mathrm{M0}: \text{no projection}, \quad
+    \mathrm{M1}: \text{core-only DiffStateGrad}, \quad
+    \mathrm{M2}: \text{proper tangent}, \quad
+    \mathrm{M4}: \text{soft tangent}.
+\]
+报告指标：
+\[
+    \text{PSNR}, \quad \text{SSIM}, \quad \text{LPIPS}, \quad
+    \|A(\hat{x})-y\|_2^2, \quad
+    \text{runtime}.
+\]
+
+\subsection{Go/No-Go 标准}
+
+若 proper tangent 相比 core-only 满足任一条件，则值得进入更大规模实验：
+\begin{itemize}
+    \item 平均 PSNR 提升至少 $0.2$ dB；
+    \item 平均 LPIPS 下降至少 $3\%$；
+    \item worst-$10\%$ LPIPS 下降至少 $8\%$；
+    \item phase retrieval failure rate 明显下降；
+    \item measurement residual 改善且视觉质量不下降。
+\end{itemize}
+
+如果 M2 平均指标无提升但 residual 明显更好，说明 proper tangent 更忠实于测量，但可能需要 soft gate 控制自由度。
+如果 M2 和 M4 都无提升，则说明低秩矩阵切线空间本身可能也不是扩散图像流形的好近似。
+
+\section{实现建议}
+
+现有代码中，原投影大致为
+\[
+    A = U[:, :, :r], \qquad B = V^\top[:, :r, :],
+\]
+\[
+    G_{\mathrm{core}} = A A^\top G B^\top B .
+\]
+建议新增统一接口：
+\[
+    \texttt{projection\_mode}
+    \in
+    \{
+    \texttt{none},
+    \texttt{core},
+    \texttt{tangent},
+    \texttt{soft\_core},
+    \texttt{soft\_tangent}
+    \}.
+\]
+
+对单个通道或 batch-channel 维度，proper tangent 可以实现为：
+\[
+    P_U = U_r U_r^\top, \qquad P_V = V_r V_r^\top,
+\]
+\[
+    G_{\mathrm{tan}} = P_U G + G P_V - P_U G P_V.
+\]
+
+需要记录的调试量：
+\begin{itemize}
+    \item $\|G\|_F$；
+    \item $\|G_{\mathrm{core}}\|_F$；
+    \item $\|G_{\mathrm{tan}}\|_F$；
+    \item $\|G_{\mathrm{tan}} - G_{\mathrm{core}}\|_F$；
+    \item rank $r$；
+    \item 每个 diffusion step 的 runtime。
+\end{itemize}
+
+\section{主要风险}
+
+\begin{enumerate}[label=\textbf{R\arabic*.}]
+    \item \textbf{低秩矩阵流形不等于自然图像流形。}
+    即使 proper tangent 在矩阵几何上正确，它也未必是生成模型图像流形的真实切线空间。
+
+    \item \textbf{Proper tangent 可能过宽。}
+    相比 core-only，proper tangent 保留更多梯度方向，可能提升 measurement consistency，也可能重新引入伪影。
+
+    \item \textbf{实验提升可能依赖任务。}
+    线性任务上差异可能小，phase retrieval 或强遮挡任务更可能暴露差异。
+
+    \item \textbf{多通道处理需要谨慎。}
+    对 RGB 通道分别做 SVD、共享 rank、还是把通道合并处理，会影响投影含义。
+\end{enumerate}
+
+\section{暂定结论}
+
+动态阈值是一个合理但偏小的改动。
+相比之下，重新审视 DiffStateGrad 的切线空间近似更有研究价值。
+现有 DiffStateGrad 的投影并不是完整的低秩矩阵切线投影，而是 core-only 投影。
+因此，一个更强的研究问题是：
+\begin{quote}
+DiffStateGrad 的收益来自正确的切线空间约束，还是来自过窄的谱 core 滤波？
+\end{quote}
+如果 proper tangent 或 soft tangent 在小规模实验中优于 core-only，那么这条线比单纯动态阈值更值得继续。
+如果它们没有提升，则反过来说明 ``低秩矩阵切线空间'' 本身可能不是 diffusion image manifold 的好近似，这也是一个有价值的负面发现。
+
+\section*{Claim--Evidence Map}
+
+\begin{table}[h]
+\centering
+\caption{当前草稿中的主要论断及证据状态。}
+\label{tab:claims}
+\begin{tabular}{p{0.38\linewidth}p{0.38\linewidth}p{0.16\linewidth}}
+\toprule
+Claim & Evidence & Status \\
+\midrule
+原 DiffStateGrad 使用的是 core-only 投影。 &
+由代码形式 $U_rU_r^\top G V_rV_r^\top$ 直接推出。 &
+Supported \\
+\addlinespace
+Core-only 投影不是 rank-$r$ 矩阵流形的完整切线投影。 &
+标准低秩矩阵流形切线投影公式为式 \eqref{eq:tangent}。 &
+Supported \\
+\addlinespace
+Proper tangent 可能比 core-only 更有效。 &
+目前只有几何动机，尚无实验结果。 &
+Needs evidence \\
+\addlinespace
+Soft tangent 可能兼顾稳定性与数据一致性。 &
+目前是方法假设，需要 Pilot 验证。 &
+Needs evidence \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section*{Self-Review Checklist}
+
+\begin{enumerate}[label=\textbf{\arabic*.}]
+    \item \textbf{Contribution:} 本文档的核心新意是几何诊断，而不是阈值调参；这一点已经明确。
+    \item \textbf{Writing clarity:} 文档先定义原投影，再定义正确切线投影，最后给实验设计，逻辑是可读的。
+    \item \textbf{Experimental strength:} 当前没有真实重建实验，因此所有性能论断都必须保持为假设。
+    \item \textbf{Evaluation completeness:} 需要补充 measurement residual、failure rate、worst-case LPIPS，否则无法证明 robustness。
+    \item \textbf{Method soundness:} 最大风险是低秩矩阵流形不等于扩散模型图像流形；后续实验需要诚实验证这个假设。
+\end{enumerate}
+
+\end{document}

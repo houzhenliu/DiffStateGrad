@@ -5,7 +5,10 @@ from functools import partial
 import yaml
 from torch.nn import functional as F
 from torchvision import torch
-from motionblur.motionblur import Kernel
+try:
+    from motionblur.motionblur import Kernel
+except ImportError:
+    Kernel = None
 import numpy as np
 
 from util.resizer import Resizer
@@ -101,6 +104,8 @@ class MotionBlurOperator(LinearOperator):
                                std=intensity,
                                device=device).to(device)  # should we keep this device term?
 
+        if Kernel is None:
+            raise ImportError("motionblur is required for the motion_blur operator.")
         self.kernel = Kernel(size=(kernel_size, kernel_size), intensity=intensity)
         kernel = torch.tensor(self.kernel.kernelMatrix, dtype=torch.float32)
         self.conv.update_weights(kernel)

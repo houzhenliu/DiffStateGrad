@@ -54,7 +54,8 @@ def compute_svd_and_adaptive_rank(z_t, var_cutoff):
     
     return U, s, Vh, adaptive_rank
 
-def apply_diffstategrad(norm_grad, iteration_count, period, U=None, s=None, Vh=None, adaptive_rank=None):
+def apply_diffstategrad(norm_grad, iteration_count, period, U=None, s=None, Vh=None, adaptive_rank=None,
+                        projection_mode="core"):
     """
     Compute projected gradient using DiffStateGrad algorithm.
     
@@ -66,20 +67,44 @@ def apply_diffstategrad(norm_grad, iteration_count, period, U=None, s=None, Vh=N
         s: Singular values from SVD
         Vh: Right singular vectors from SVD
         adaptive_rank: Computed adaptive rank
+        projection_mode: Projection type. "core" matches the original DiffStateGrad
+                         implementation; "tangent" uses the rank-r matrix tangent
+                         projection; "none" disables projection.
         
     Returns:
         torch.Tensor: Projected gradient if period condition is met, otherwise original gradient
     """
+    if projection_mode in ["none", None] or period == 0:
+        return norm_grad
+
     if period != 0 and iteration_count % period == 0:
         if any(param is None for param in [U, s, Vh, adaptive_rank]):
             raise ValueError("SVD components and adaptive_rank must be provided when iteration_count % period == 0")
+
+        if projection_mode == "fixed":
+            projection_mode = "core"
+        if projection_mode == "normal_removed":
+            projection_mode = "tangent"
         
-        # Project gradient
+        if projection_mode not in ["core", "tangent"]:
+            raise ValueError(f"Unknown projection_mode '{projection_mode}'")
+
         A = U[:, :, :adaptive_rank]
         B = Vh[:, :adaptive_rank, :]
-        
-        low_rank_grad = torch.matmul(A.permute(0, 2, 1), norm_grad[0]) @ B.permute(0, 2, 1)
-        projected_grad = torch.matmul(A, low_rank_grad) @ B
+        grad = norm_grad[0]
+
+        # Original DiffStateGrad: core-only spectral projection
+        low_rank_grad = torch.matmul(A.permute(0, 2, 1), grad) @ B.permute(0, 2, 1)
+        core_grad = torch.matmul(A, low_rank_grad) @ B
+
+        if projection_mode == "core":
+            projected_grad = core_grad
+        else:
+            # Proper rank-r matrix tangent projection:
+            # P_T(G) = U U^T G + G V V^T - U U^T G V V^T.
+            left_grad = torch.matmul(A, torch.matmul(A.permute(0, 2, 1), grad))
+            right_grad = torch.matmul(torch.matmul(grad, B.permute(0, 2, 1)), B)
+            projected_grad = left_grad + right_grad - core_grad
         
         # Reshape projected gradient to match original shape
         projected_grad = projected_grad.float().unsqueeze(0)  # Add batch dimension back
@@ -97,8 +122,9 @@ class DDIMSampler(object):
 
     def register_buffer(self, name, attr):
         if type(attr) == torch.Tensor:
-            if attr.device != torch.device("cuda"):
-                attr = attr.to(torch.device("cuda"))
+            target_device = next(self.model.parameters()).device
+            if attr.device != target_device:
+                attr = attr.to(target_device)
         setattr(self, name, attr)
 
     def make_schedule(self, ddim_num_steps, ddim_discretize="uniform", ddim_eta=0., verbose=True):
@@ -221,6 +247,9 @@ class DDIMSampler(object):
                latent_lr=None,
                var_cutoff=None,
                period=None,
+               projection_mode="core",
+               pixel_max_iters=2000,
+               latent_max_iters=500,
                # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                **kwargs
                ):
@@ -259,7 +288,10 @@ class DDIMSampler(object):
                                                         log_every_t=log_every_t,
                                                         unconditional_guidance_scale=unconditional_guidance_scale,
                                                         unconditional_conditioning=unconditional_conditioning, pixel_lr=pixel_lr,
-                                                        latent_lr=latent_lr, var_cutoff=var_cutoff, period = period
+                                                        latent_lr=latent_lr, var_cutoff=var_cutoff, period=period,
+                                                        projection_mode=projection_mode,
+                                                        pixel_max_iters=pixel_max_iters,
+                                                        latent_max_iters=latent_max_iters
                                                         )
             
         else:
@@ -274,7 +306,8 @@ class DDIMSampler(object):
                      mask=None, x0=None, img_callback=None, log_every_t=100,
                      temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                      unconditional_guidance_scale=1., unconditional_conditioning=None, pixel_lr=None, latent_lr=None,
-                     var_cutoff=None, period=None):
+                     var_cutoff=None, period=None, projection_mode="core",
+                     pixel_max_iters=2000, latent_max_iters=500):
         """
         DDIM-based sampling function for ReSample.
 
@@ -383,8 +416,10 @@ class DDIMSampler(object):
 
                         opt_var = self.pixel_optimization(measurement=measurement, 
                                                           x_prime=pseudo_x0_pixel,
-                                                          operator_fn=operator_fn, lr=pixel_lr, var_cutoff=var_cutoff,
-                                                          x_prev=self.model.decode_first_stage(img.detach().clone()), period=period)
+                                                          operator_fn=operator_fn, max_iters=pixel_max_iters,
+                                                          lr=pixel_lr, var_cutoff=var_cutoff,
+                                                          x_prev=self.model.decode_first_stage(img.detach().clone()),
+                                                          period=period, projection_mode=projection_mode)
                         
                         opt_var = self.model.encode_first_stage(opt_var) # Going back into latent space
 
@@ -396,8 +431,10 @@ class DDIMSampler(object):
                         # Enforcing consistency via latent space optimization
                         pseudo_x0, _ = self.latent_optimization(measurement=measurement,
                                                              z_init=pseudo_x0.detach(),
-                                                             operator_fn=operator_fn, lr=latent_lr, var_cutoff=var_cutoff,
-                                                             z_prev=img.detach(), period=period)
+                                                             operator_fn=operator_fn, max_iters=latent_max_iters,
+                                                             lr=latent_lr, var_cutoff=var_cutoff,
+                                                             z_prev=img.detach(), period=period,
+                                                             projection_mode=projection_mode)
 
 
                         sigma = 40 * (1-a_prev)/(1 - a_t) * (1 - a_t / a_prev) # Change the 40 value for each task
@@ -413,20 +450,22 @@ class DDIMSampler(object):
         
         psuedo_x0, _ = self.latent_optimization(measurement=measurement,
                                                              z_init=img.detach(),
-                                                             operator_fn=operator_fn, lr=latent_lr, var_cutoff=var_cutoff,
-                                                             z_prev=img.detach(), period=period)
+                                                             operator_fn=operator_fn, max_iters=latent_max_iters,
+                                                             lr=latent_lr, var_cutoff=var_cutoff,
+                                                             z_prev=img.detach(), period=period,
+                                                             projection_mode=projection_mode)
         img = psuedo_x0.detach().clone()
             
         return img, intermediates
 
 
-    def pixel_optimization(self, measurement, x_prime, operator_fn, eps=1e-3, max_iters=2000, lr=None, var_cutoff=None, x_prev=None, period=None):
+    def pixel_optimization(self, measurement, x_prime, operator_fn, eps=1e-3, max_iters=2000, lr=None, var_cutoff=None, x_prev=None, period=None, projection_mode="core"):
         """
         Function to compute argmin_x ||y - A(x)||_2^2
 
         Arguments:
             measurement:           Measurement vector y in y=Ax+n.
-            x_prime:               Estimation of \hat{x}_0 using Tweedie's formula
+            x_prime:               Estimation of \\hat{x}_0 using Tweedie's formula
             operator_fn:           Operator to perform forward operation A(.)
             eps:                   Tolerance error
             max_iters:             Maximum number of GD iterations
@@ -446,7 +485,10 @@ class DDIMSampler(object):
         measurement = measurement.detach() # Need to detach for weird PyTorch reasons
 
         # Calculate SVD and adaptive rank in prep for DiffStateGrad
-        U, s, Vh, adaptive_rank = compute_svd_and_adaptive_rank(x_prev, var_cutoff)
+        if projection_mode in ["none", None] or period == 0:
+            U, s, Vh, adaptive_rank = None, None, None, None
+        else:
+            U, s, Vh, adaptive_rank = compute_svd_and_adaptive_rank(x_prev, var_cutoff)
 
         # Training loop
 
@@ -457,8 +499,8 @@ class DDIMSampler(object):
             
             measurement_loss.backward() # Take GD step
 
-            opt_var.grad = apply_diffstategrad(opt_var.grad, itr, period, 
-            U, s, Vh, adaptive_rank)
+            opt_var.grad = apply_diffstategrad(opt_var.grad, itr, period,
+            U, s, Vh, adaptive_rank, projection_mode=projection_mode)
 
             optimizer.step()
 
@@ -469,7 +511,7 @@ class DDIMSampler(object):
         return opt_var
 
 
-    def latent_optimization(self, measurement, z_init, operator_fn, eps=1e-3, max_iters=500, lr=None, var_cutoff=None, z_prev=None, period=None):
+    def latent_optimization(self, measurement, z_init, operator_fn, eps=1e-3, max_iters=500, lr=None, var_cutoff=None, z_prev=None, period=None, projection_mode="core"):
 
         """
         Function to compute argmin_z ||y - A( D(z) )||_2^2
@@ -500,7 +542,10 @@ class DDIMSampler(object):
         measurement = measurement.detach() # Need to detach for weird PyTorch reasons
 
         # Calculate SVD and adaptive rank in prep for DiffStateGrad
-        U, s, Vh, adaptive_rank = compute_svd_and_adaptive_rank(z_prev, var_cutoff)
+        if projection_mode in ["none", None] or period == 0:
+            U, s, Vh, adaptive_rank = None, None, None, None
+        else:
+            U, s, Vh, adaptive_rank = compute_svd_and_adaptive_rank(z_prev, var_cutoff)
 
         # Training loop
         init_loss = 0
@@ -515,8 +560,8 @@ class DDIMSampler(object):
             
             output.backward() # Take GD step
 
-            z_init.grad = apply_diffstategrad(z_init.grad, itr, period, 
-            U, s, Vh, adaptive_rank)
+            z_init.grad = apply_diffstategrad(z_init.grad, itr, period,
+            U, s, Vh, adaptive_rank, projection_mode=projection_mode)
 
             optimizer.step()
             cur_loss = output.detach().cpu().numpy() 

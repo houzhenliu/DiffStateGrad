@@ -122,12 +122,14 @@ def make_folder(sample_path, opt):
     pixel_lr_str = "-pixel_lr=({:.0e})".format(opt.pixel_lr)
     latent_lr_str = "-latent_lr=({:.0e})".format(opt.latent_lr)
     period_str = "-period=({:d})".format(opt.period)
+    projection_mode_str = "-projection=({})".format(opt.projection_mode)
 
     folder_name += variance_cutoff_str
     folder_name += image_str
     folder_name += pixel_lr_str
     folder_name += latent_lr_str
     folder_name += period_str
+    folder_name += projection_mode_str
 
     folder_path = os.path.join(sample_path, folder_name)
     os.makedirs(folder_path, exist_ok=True)  # Create folder if it doesn't exist
@@ -141,6 +143,8 @@ parser.add_argument('--task_config', default="configs/tasks/gaussian_deblur_conf
 parser.add_argument('--gpu', type=int, default=0)
 parser.add_argument('--save_dir', type=str, default='./results')
 parser.add_argument('--ddim_steps', default=500, type=int)
+parser.add_argument('--ddim_use_original_steps', action='store_true',
+                    help="Use all original DDPM steps. Leave unset to make --ddim_steps effective.")
 parser.add_argument('--ddim_eta', default=0.0, type=float)
 parser.add_argument('--n_samples_per_class', default=1, type=int)
 parser.add_argument('--ddim_scale', default=1.0, type=float)
@@ -148,8 +152,13 @@ parser.add_argument('--image_id', default=60000, type=int)
 parser.add_argument('--var_cutoff', default=0.99, type=float)
 parser.add_argument('--pixel_lr', default=1e-2, type=float)
 parser.add_argument('--latent_lr', default=5e-3, type=float)
+parser.add_argument('--pixel_max_iters', default=2000, type=int)
+parser.add_argument('--latent_max_iters', default=500, type=int)
 parser.add_argument('--seed', default=42, type=int)
 parser.add_argument('--period', default=1, type=int)
+parser.add_argument('--projection_mode', default="core",
+                    choices=["none", "core", "fixed", "tangent", "normal_removed"],
+                    help="Gradient projection mode. 'core' matches the original DiffStateGrad implementation; 'tangent' uses the rank-r matrix tangent projection.")
 
 args = parser.parse_args()
 
@@ -188,14 +197,17 @@ sample_fn = partial(sampler.posterior_sampler, measurement_cond_fn=measurement_c
                                         S=args.ddim_steps,
                                         cond_method=task_config['conditioning']['main_sampler'],
                                         conditioning=None,
-                                        ddim_use_original_steps=True,
+                                        ddim_use_original_steps=args.ddim_use_original_steps,
                                         batch_size=args.n_samples_per_class,
                                         shape=[3, 64, 64], # Dimension of latent space
                                         verbose=False,
                                         unconditional_guidance_scale=args.ddim_scale,
                                         unconditional_conditioning=None, 
                                         eta=args.ddim_eta, pixel_lr=args.pixel_lr, latent_lr=args.latent_lr,
-                                        var_cutoff=args.var_cutoff, period=args.period)
+                                        var_cutoff=args.var_cutoff, period=args.period,
+                                        projection_mode=args.projection_mode,
+                                        pixel_max_iters=args.pixel_max_iters,
+                                        latent_max_iters=args.latent_max_iters)
 
 # Working directory
 out_path = os.path.join(args.save_dir)
